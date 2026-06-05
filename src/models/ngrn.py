@@ -13,6 +13,21 @@ import torch
 import torch.nn as torch_nn
 import torch.nn.functional as F
 from collections import defaultdict
+from pathlib import Path
+
+
+def resolve_sparse_group_adj_for_train(data_dir, sparse_flag: bool, dense_flag: bool) -> bool:
+    """
+    是否对群内 GCN 使用稀疏归一化邻接。
+    默认：data_dir 末级目录名为 ml10m 时为 True（避免超大群 T×T 稠密矩阵 OOM），否则 False（稠密通常更快）。
+    """
+    if sparse_flag and dense_flag:
+        raise ValueError("不能同时指定 --sparse_group_adj 与 --dense_group_adj")
+    if sparse_flag:
+        return True
+    if dense_flag:
+        return False
+    return Path(str(data_dir)).resolve().name.lower() == "ml10m"
 
 
 def _to_tensor(x, device):
@@ -88,8 +103,11 @@ class WeightedGCNLayer(torch_nn.Module):
         self.linear = torch_nn.Linear(in_dim, out_dim)
 
     def forward(self, H, A_norm):
-        # H: (T, in_dim), A_norm: (T, T) 已归一化
-        H = A_norm @ H
+        # H: (T, in_dim), A_norm: (T, T) dense 或 sparse COO 已归一化
+        if getattr(A_norm, "is_sparse", False):
+            H = torch.sparse.mm(A_norm, H)
+        else:
+            H = A_norm @ H
         return F.relu(self.linear(H))
 
 
@@ -143,6 +161,11 @@ class NGRN(torch_nn.Module):
         dropout=0.1,
         max_neighbors=500,
         device="cpu",
+        edge_weight_mode="learned",
+        use_neighbor_fusion=True,
+        use_gcn=True,
+        use_skip_connection=True,
+        use_sparse_group_adj=False,
     ):
         super().__init__()
         self.n_users = n_users
@@ -152,6 +175,13 @@ class NGRN(torch_nn.Module):
         self.gcn_layers = gcn_layers
         self.max_neighbors = max_neighbors
         self.device = device
+        # 消融: learned=σ(α·w_jaccard+β); jaccard=原始重叠权; uniform=群内边权恒为1
+        self.edge_weight_mode = edge_weight_mode
+        self.use_neighbor_fusion = use_neighbor_fusion
+        self.use_gcn = use_gcn
+        self.use_skip_connection = use_skip_connection
+        # 大群组 T×T 稠密邻接易 OOM（如 ml10m）；稀疏版用 torch.sparse.mm，小数据集用稠密更快
+        self.use_sparse_group_adj = use_sparse_group_adj
 
         self.user_emb = torch_nn.Embedding(n_users, d)
         self.item_emb = torch_nn.Embedding(n_items, d)
@@ -183,21 +213,78 @@ class NGRN(torch_nn.Module):
     def _norm_adj(self, V_c, E_c):
         """从 V_c 和 E_c (local_idx, local_idx, w_jaccard) 构建对称 D^{-1/2} A_tilde D^{-1/2}。
 
-        这里在原始的 Jaccard 边权 w_jaccard 上添加可学习变换：
-        weight(u,v) = sigmoid(alpha * w_jaccard + beta)。
+        edge_weight_mode:
+          learned: sigmoid(alpha * w_jaccard + beta)
+          jaccard: 使用数据侧 Jaccard 权 w
+          cosine: 使用数据侧 Cosine 权 w
+          uniform: 有边则权为 1
         """
         T = len(V_c)
-        A = torch.zeros((T, T), device=self.device)
+        if T == 0:
+            if self.use_sparse_group_adj:
+                return torch.sparse_coo_tensor(
+                    torch.zeros((2, 0), dtype=torch.long, device=self.device),
+                    torch.zeros((0,), dtype=torch.float32, device=self.device),
+                    (0, 0),
+                    device=self.device,
+                )
+            return torch.zeros(0, 0, device=self.device)
+
+        if not self.use_sparse_group_adj:
+            A = torch.zeros((T, T), device=self.device)
+            for i, j, w in E_c:
+                base = torch.tensor(float(w), device=self.device)
+                if self.edge_weight_mode == "uniform":
+                    w_ij = torch.tensor(1.0, device=self.device)
+                elif self.edge_weight_mode in ("jaccard", "cosine"):
+                    w_ij = base
+                else:
+                    w_ij = torch.sigmoid(self.edge_alpha * base + self.edge_beta)
+                if i == j:
+                    A[i, j] = w_ij
+                else:
+                    A[i, j] = w_ij
+                    A[j, i] = w_ij
+            A = A + torch.eye(T, device=self.device, dtype=A.dtype)
+            D = A.sum(dim=1)
+            d_inv_sqrt = torch.pow(D + 1e-8, -0.5)
+            return d_inv_sqrt.unsqueeze(1) * A * d_inv_sqrt.unsqueeze(0)
+
+        rows, cols, vals = [], [], []
         for i, j, w in E_c:
             base = torch.tensor(float(w), device=self.device)
-            w_ij = torch.sigmoid(self.edge_alpha * base + self.edge_beta)
-            A[i, j] = w_ij
-            A[j, i] = w_ij
-        A = A + torch.eye(T, device=self.device)
-        D = A.sum(dim=1)
-        D_inv_sqrt = torch.pow(D + 1e-8, -0.5)
-        A_norm = D_inv_sqrt.unsqueeze(1) * A * D_inv_sqrt.unsqueeze(0)
-        return A_norm
+            if self.edge_weight_mode == "uniform":
+                w_ij = torch.tensor(1.0, device=self.device)
+            elif self.edge_weight_mode in ("jaccard", "cosine"):
+                w_ij = base
+            else:
+                w_ij = torch.sigmoid(self.edge_alpha * base + self.edge_beta)
+            if i == j:
+                rows.append(i)
+                cols.append(j)
+                vals.append(w_ij)
+            else:
+                rows.extend([i, j])
+                cols.extend([j, i])
+                vals.extend([w_ij, w_ij])
+
+        one = torch.tensor(1.0, device=self.device)
+        for i in range(T):
+            rows.append(i)
+            cols.append(i)
+            vals.append(one)
+
+        row_idx = torch.tensor(rows, dtype=torch.long, device=self.device)
+        col_idx = torch.tensor(cols, dtype=torch.long, device=self.device)
+        val = torch.stack(vals).float()
+
+        deg = torch.zeros(T, device=self.device)
+        deg.index_add_(0, row_idx, val)
+        d_inv_sqrt = torch.pow(deg + 1e-8, -0.5)
+        norm_val = val * d_inv_sqrt[row_idx] * d_inv_sqrt[col_idx]
+
+        idx = torch.stack([row_idx, col_idx], dim=0)
+        return torch.sparse_coo_tensor(idx, norm_val, (T, T), device=self.device).coalesce()
 
     def _group_representation(self, group_idx, subgraph_data):
         """
@@ -214,28 +301,33 @@ class NGRN(torch_nn.Module):
 
         A_norm = self._norm_adj(V_c, E_c)
 
-        H = X_c
-        for layer in self.gcn:
-            H = layer(H, A_norm)
-            H = self.dropout(H)
-        h_c = H.mean(dim=0)
+        if self.use_gcn and self.gcn_layers > 0:
+            H = X_c
+            for layer in self.gcn:
+                H = layer(H, A_norm)
+                H = self.dropout(H)
+            h_c = H.mean(dim=0)
+        else:
+            h_c = X_c.mean(dim=0)
 
-        if nbr_list:
+        if self.use_neighbor_fusion and nbr_list:
             # 仅保留在 user_emb 范围内的邻居，避免 IndexError（数据中边可能含评分外用户）
             n_users = self.user_emb.num_embeddings
             valid = [(u, s) for u, s in zip(nbr_list, s_c_u) if 0 <= u < n_users]
             nbr_list = [u for u, _ in valid]
             s_c_u = [s for _, s in valid]
-        if nbr_list:
-            s_arr = np.array(s_c_u, dtype=np.float32)
-            if len(nbr_list) > self.max_neighbors:
-                top_idx = np.argsort(s_arr)[-self.max_neighbors:]
-                nbr_list = [nbr_list[i] for i in top_idx]
-                s_c_u = s_arr[top_idx].tolist()
-            nbr_ids = _to_tensor(np.array(nbr_list), self.device).long()
-            neighbor_embs = self.user_emb(nbr_ids)
-            s_c_u = np.array(s_c_u, dtype=np.float32)
-            h_c_nbr = self.neighbor_fusion(h_c, neighbor_embs, s_c_u)
+            if nbr_list:
+                s_arr = np.array(s_c_u, dtype=np.float32)
+                if len(nbr_list) > self.max_neighbors:
+                    top_idx = np.argsort(s_arr)[-self.max_neighbors:]
+                    nbr_list = [nbr_list[i] for i in top_idx]
+                    s_c_u = s_arr[top_idx].tolist()
+                nbr_ids = _to_tensor(np.array(nbr_list), self.device).long()
+                neighbor_embs = self.user_emb(nbr_ids)
+                s_c_u = np.array(s_c_u, dtype=np.float32)
+                h_c_nbr = self.neighbor_fusion(h_c, neighbor_embs, s_c_u)
+            else:
+                h_c_nbr = torch.zeros_like(h_c)
         else:
             h_c_nbr = torch.zeros_like(h_c)
 
@@ -243,7 +335,10 @@ class NGRN(torch_nn.Module):
         h_cat = self.dropout(h_cat)
         h_struct = self.W3(h_cat)
         mean_member = X_c.mean(dim=0)
-        h_tilde_c = h_struct + torch.sigmoid(self.skip_scale) * self.W_skip(mean_member)
+        if self.use_skip_connection:
+            h_tilde_c = h_struct + torch.sigmoid(self.skip_scale) * self.W_skip(mean_member)
+        else:
+            h_tilde_c = h_struct
         return h_tilde_c
 
     def forward_group_representations(self, subgraph_data, group_indices=None):
