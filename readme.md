@@ -1,4 +1,4 @@
-# train_optimized.py
+# train.py
 
 NGRN training for **item → groups** ranking: load joint social + rating data, build k-core candidate groups, train with ranking + tag loss, pick the best checkpoint on validation, report Prec/Rec/NDCG@K on the test split.
 
